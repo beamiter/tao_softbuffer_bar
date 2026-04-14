@@ -167,7 +167,6 @@ struct App {
 
     // 更新时间控制
     last_monitor_update: Instant,
-    last_time_bucket: u64, // 按秒或分钟的时间 bucket（由 show_seconds 决定）
 
     // 记录最近一次鼠标物理坐标（像素）
     last_cursor_pos_px: Option<(i32, i32)>,
@@ -222,7 +221,6 @@ impl App {
             scale_factor: scale,
             logical_size,
             last_monitor_update: Instant::now(),
-            last_time_bucket: 0,
             last_cursor_pos_px: None,
             soft_surface: None,
         }
@@ -285,8 +283,6 @@ impl App {
         self.back = Some(back);
         self.soft_surface = Some(soft_surface);
 
-        // 初始化时间 bucket 并首次绘制
-        self.last_time_bucket = self.current_time_bucket();
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -370,32 +366,14 @@ impl App {
     }
 
     fn handle_button(&mut self, px: i32, py: i32, button_id: u8) {
-        // 记录 show_seconds 切换前的值
-        let prev_show_seconds = self.state.show_seconds;
         let prev_theme = self.state.theme_mode;
         if self.state.handle_buttons(px as i16, py as i16, button_id) {
             if self.state.theme_mode != prev_theme {
                 self.colors = tuned_colors_for_theme(self.state.theme_mode);
             }
-            // 若 show_seconds 改变，立即更新时间 bucket，避免等待到下一次 tick 才更新
-            if self.state.show_seconds != prev_show_seconds {
-                self.last_time_bucket = self.current_time_bucket();
-            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-        }
-    }
-
-    // 根据 show_seconds 计算时间 bucket（秒或分钟）
-    fn current_time_bucket(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0));
-        if self.state.show_seconds {
-            now.as_secs()
-        } else {
-            now.as_secs() / 60
         }
     }
 }
@@ -468,21 +446,22 @@ fn main() -> Result<()> {
                 UserEvent::Tick => {
                     let mut need_redraw = false;
 
-                    // 时间 bucket 变化才重绘（秒或分钟由 state.show_seconds 决定）
-                    let bucket = app.current_time_bucket();
-                    if bucket != app.last_time_bucket {
-                        app.last_time_bucket = bucket;
-                        log::trace!("redraw by time bucket update: {}", bucket);
+                    // 1. 检查时间字符串是否变化
+                    let new_time = app.state.format_time();
+                    if new_time != app.state.last_time_string {
+                        app.state.last_time_string = new_time;
+                        log::trace!("redraw by time update");
                         need_redraw = true;
                     }
 
-                    // 系统监控定期更新（2s）
+                    // 2. 检查系统监控数据及音频数据是否更新
                     if app.last_monitor_update.elapsed() >= Duration::from_secs(2) {
-                        app.state.system_monitor.update_if_needed();
-                        app.state.audio_manager.update_if_needed();
+                        need_redraw |= app.state.system_monitor.update_if_needed();
+                        need_redraw |= app.state.audio_manager.update_if_needed();
                         app.last_monitor_update = Instant::now();
-                        log::trace!("maybe redraw by system update");
-                        need_redraw = true;
+                        if need_redraw {
+                            log::trace!("redraw by system/audio update");
+                        }
                     }
 
                     if need_redraw {
@@ -582,12 +561,7 @@ fn main() -> Result<()> {
                                     MouseButton::Other(n) => n as u8,
                                     _ => todo!(),
                                 };
-                                let prev_show_seconds = app.state.show_seconds;
                                 app.handle_button(px, py, button_id);
-                                // show_seconds 改变无需重新调度（无 WaitUntil），tick 线程会驱动
-                                if app.state.show_seconds != prev_show_seconds {
-                                    // 已在 handle_button 内更新 last_time_bucket，并触发 redraw
-                                }
                             }
                         }
                     }
