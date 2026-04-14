@@ -374,7 +374,7 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::SharedUpdated) => {
-                    app.window.request_redraw();
+                app.window.request_redraw();
                 if let Some(buf_arc) = app.state.shared_buffer.as_ref().cloned() {
                     match buf_arc.try_read_latest_message() {
                         Ok(Some(msg)) => {
