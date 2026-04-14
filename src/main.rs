@@ -87,7 +87,7 @@ fn spawn_tick_thread(proxy: EventLoopProxy<UserEvent>) {
             thread::sleep(Duration::from_millis(1000));
             let _ = proxy.send_event(UserEvent::Tick);
         }
-
+    });
 }
 
 fn spawn_shared_thread(proxy: EventLoopProxy<UserEvent>, shared_efd: Option<i32>) {
@@ -362,27 +362,23 @@ fn main() {
 
         match event {
             Event::UserEvent(UserEvent::Tick) => {
-                let mut need_redraw = false;
                 if app.last_clock_update.elapsed() >= Duration::from_secs(1) {
                     app.last_clock_update = Instant::now();
-                    need_redraw = true;
+                    app.window.request_redraw();
                 }
                 if app.last_monitor_update.elapsed() >= Duration::from_secs(2) {
                     app.state.system_monitor.update_if_needed();
                     app.state.audio_manager.update_if_needed();
                     app.last_monitor_update = Instant::now();
-                    need_redraw = true;
-                }
-                if need_redraw {
                     app.window.request_redraw();
                 }
             }
             Event::UserEvent(UserEvent::SharedUpdated) => {
+                    app.window.request_redraw();
                 if let Some(buf_arc) = app.state.shared_buffer.as_ref().cloned() {
                     match buf_arc.try_read_latest_message() {
                         Ok(Some(msg)) => {
                             app.state.update_from_shared(msg);
-                            app.window.request_redraw();
                         }
                         Ok(None) => {}
                         Err(e) => warn!("Shared try_read_latest_message failed: {}", e),
