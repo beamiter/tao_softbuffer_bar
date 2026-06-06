@@ -17,9 +17,9 @@ use tao::{
 };
 
 use xbar_core::{
-    AppState, BarConfig, Color, Rect, ShapeStyle, ThemeMode,
+    AppState, BarConfig, Color, ShapeStyle, ThemeMode,
     cairo::{Context, Format, ImageSurface},
-    colors_for_theme, draw_bar, initialize_logging,
+    colors_for_theme, draw_bar_with_background_opacity, initialize_logging,
     pango::FontDescription,
     spawn_shared_eventfd_notifier,
 };
@@ -56,109 +56,6 @@ fn background_opacity_from_env() -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .map(|value| value.clamp(0.0, 1.0))
         .unwrap_or(0.0)
-}
-
-fn set_argb32_pixel_opacity(pixel: &mut [u8], opacity: f64) {
-    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u16;
-
-    #[cfg(target_endian = "little")]
-    let channels = [0usize, 1, 2];
-    #[cfg(target_endian = "big")]
-    let channels = [1usize, 2, 3];
-
-    for channel in channels {
-        pixel[channel] = ((pixel[channel] as u16 * alpha + 127) / 255) as u8;
-    }
-
-    #[cfg(target_endian = "little")]
-    {
-        pixel[3] = alpha as u8;
-    }
-    #[cfg(target_endian = "big")]
-    {
-        pixel[0] = alpha as u8;
-    }
-}
-
-fn is_inside_round_rect(px: usize, py: usize, rect: &Rect, radius: f64) -> bool {
-    if rect.w == 0 || rect.h == 0 {
-        return false;
-    }
-
-    let x0 = rect.x as f64;
-    let y0 = rect.y as f64;
-    let x1 = x0 + rect.w as f64;
-    let y1 = y0 + rect.h as f64;
-    let x = px as f64 + 0.5;
-    let y = py as f64 + 0.5;
-
-    if x < x0 || x >= x1 || y < y0 || y >= y1 {
-        return false;
-    }
-
-    let radius = radius.min(rect.w as f64 / 2.0).min(rect.h as f64 / 2.0) + 1.0;
-    if radius <= 1.0 {
-        return true;
-    }
-
-    let inner_x0 = x0 + radius;
-    let inner_y0 = y0 + radius;
-    let inner_x1 = x1 - radius;
-    let inner_y1 = y1 - radius;
-
-    if (x >= inner_x0 && x < inner_x1) || (y >= inner_y0 && y < inner_y1) {
-        return true;
-    }
-
-    let nearest_x = x.clamp(inner_x0, inner_x1);
-    let nearest_y = y.clamp(inner_y0, inner_y1);
-    let dx = x - nearest_x;
-    let dy = y - nearest_y;
-    dx * dx + dy * dy <= radius * radius
-}
-
-fn collect_widget_rects(state: &AppState) -> Vec<Rect> {
-    let mut rects = Vec::with_capacity(19);
-    rects.extend(state.tag_rects.iter().copied());
-    rects.push(state.layout_button_rect);
-    rects.extend(state.layout_option_rects.iter().copied());
-    rects.push(state.ss_rect);
-    rects.push(state.time_rect);
-    rects.push(state.audio_rect);
-    rects.push(state.theme_rect);
-    rects.push(state.mem_rect);
-    rects.push(state.cpu_rect);
-    rects.push(state.mon_rect);
-    rects.retain(|rect| rect.w > 0 && rect.h > 0);
-    rects
-}
-
-fn apply_background_opacity(
-    data: &mut [u8],
-    stride: usize,
-    width: usize,
-    height: usize,
-    opacity: f64,
-    widget_radius: f64,
-    widget_rects: &[Rect],
-) {
-    if opacity >= 0.999 {
-        return;
-    }
-
-    for y in 0..height {
-        for x in 0..width {
-            if widget_rects
-                .iter()
-                .any(|rect| is_inside_round_rect(x, y, rect, widget_radius))
-            {
-                continue;
-            }
-
-            let offset = y * stride + x * 4;
-            set_argb32_pixel_opacity(&mut data[offset..offset + 4], opacity);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -348,7 +245,7 @@ impl App {
 
             let w_u16 = width_px.min(u16::MAX as u32) as u16;
             let h_u16 = height_px.min(u16::MAX as u32) as u16;
-            draw_bar(
+            draw_bar_with_background_opacity(
                 &cr,
                 w_u16,
                 h_u16,
@@ -356,24 +253,15 @@ impl App {
                 &mut self.state,
                 &self.font,
                 &self.cfg,
+                self.background_opacity,
             )?;
         }
 
         back.image.flush();
         let stride = back.image.stride() as usize;
-        let mut data = back.image.data()?;
+        let data = back.image.data()?;
         let w = width_px as usize;
         let h = height_px as usize;
-        let widget_rects = collect_widget_rects(&self.state);
-        apply_background_opacity(
-            &mut data[..],
-            stride,
-            w,
-            h,
-            self.background_opacity,
-            self.cfg.pill_radius,
-            &widget_rects,
-        );
 
         use bytemuck::cast_slice;
         let mut buf = self
