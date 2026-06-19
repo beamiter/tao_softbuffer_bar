@@ -187,6 +187,7 @@ impl App {
             show_audio: true,
             show_theme_toggle: true,
             volume_step: 5,
+            ..Default::default()
         };
 
         let font_str = env::var("XBAR_FONT").unwrap_or_else(|_| "monospace 11".to_string());
