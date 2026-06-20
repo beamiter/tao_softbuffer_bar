@@ -184,10 +184,17 @@ impl App {
             monitor_labels: ["🥇", "🥈", "🥉", "❔"],
             volume_label: "🔊",
             mute_label: "🔇",
+            brightness_label: "🔆",
+            battery_label: "🔋",
+            battery_charging_label: "⚡",
+            cpu_label: "🧠",
+            mem_label: "💾",
             show_audio: true,
             show_theme_toggle: true,
+            show_brightness: true,
+            show_battery: true,
             volume_step: 5,
-            ..Default::default()
+            brightness_step: 5,
         };
 
         let font_str = env::var("XBAR_FONT").unwrap_or_else(|_| "monospace 11".to_string());
