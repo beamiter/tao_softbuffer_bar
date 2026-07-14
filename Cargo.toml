@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libc = "0.2.176"
+libc = "0.2.186"
 xbar_core = { git = "https://github.com/beamiter/xbar_core.git" }
 shared_structures = { git = "https://github.com/beamiter/shared_structures.git", features = ["use-futex"] }
-softbuffer = "0.4.6"
-log = "0.4.28"
-anyhow = "1.0.100"
-bytemuck = "1.23.2"
-cairo-rs = "0.21.5"
-pango = "0.21.5"
-tao = "0.35.0"
+softbuffer = "0.4.8"
+log = "0.4.33"
+anyhow = "1.0.103"
+bytemuck = "1.25.1"
+cairo-rs = "0.22.0"
+pango = "0.22.8"
+tao = "0.35.3"
