@@ -4,13 +4,8 @@ use log::warn;
 use pango::FontDescription;
 use std::env;
 use std::num::NonZeroU32;
-use std::os::fd::AsRawFd;
-use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
@@ -21,128 +16,20 @@ use tao::{
 };
 
 use xbar_core::{
-    BarEffect, BarRuntime, ModelConfig, RuntimeUpdate, SharedEventNotifier, SharedTransport,
+    AlignedWakeThread, BarEffect, BarRuntime, ModelConfig, PlatformEffectHandler, RuntimeUpdate,
+    TransportRecoveryConfig, TransportWakeSlot, WakeAck,
     logging::init as initialize_logging,
     presentation::{Point, PointerAction, PresentationConfig, Size},
     render::cairo::CairoBar,
 };
+use xbar_linux_actions::ProcessActionHandler;
 
 const TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UserEvent {
     Tick,
-    SharedUpdated(Arc<AtomicBool>),
-}
-
-struct EventForwarder {
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl Drop for EventForwarder {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take()
-            && let Err(payload) = worker.join()
-        {
-            warn!("event forwarding thread panicked: {payload:?}");
-        }
-    }
-}
-
-fn spawn_tick_thread(proxy: EventLoopProxy<UserEvent>) -> EventForwarder {
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let worker = thread::spawn(move || {
-        while !worker_stop.load(Ordering::Acquire) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|_| Duration::from_secs(0));
-            let sleep_duration =
-                Duration::from_nanos(1_000_000_000_u64.saturating_sub(now.subsec_nanos().into()));
-            thread::sleep(sleep_duration);
-            if worker_stop.load(Ordering::Acquire) || proxy.send_event(UserEvent::Tick).is_err() {
-                break;
-            }
-        }
-    });
-    EventForwarder {
-        stop,
-        worker: Some(worker),
-    }
-}
-
-fn spawn_shared_thread(
-    proxy: EventLoopProxy<UserEvent>,
-    notifier: Option<SharedEventNotifier>,
-) -> Option<EventForwarder> {
-    notifier.map(|notifier| {
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        // The event-loop handler clears this only after it has drained the
-        // transport, so at most one shared update can be queued at a time.
-        let worker_pending = Arc::new(AtomicBool::new(false));
-        let worker = thread::spawn(move || {
-            let mut poll_fd = libc::pollfd {
-                fd: notifier.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            while !worker_stop.load(Ordering::Acquire) {
-                poll_fd.revents = 0;
-                let poll_result = unsafe { libc::poll(&mut poll_fd, 1, 250) };
-                if poll_result < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    warn!("shared notifier poll failed: {error}");
-                    break;
-                }
-                if poll_result == 0 {
-                    continue;
-                }
-                if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                    warn!(
-                        "shared notifier became unusable: poll revents={}",
-                        poll_fd.revents
-                    );
-                    break;
-                }
-                if poll_fd.revents & libc::POLLIN != 0 {
-                    match notifier.drain() {
-                        Ok(0) => {}
-                        Ok(_) => {
-                            if worker_pending
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                                .is_ok()
-                            {
-                                let event = UserEvent::SharedUpdated(Arc::clone(&worker_pending));
-                                if proxy.send_event(event).is_err() {
-                                    worker_pending.store(false, Ordering::Release);
-                                    break;
-                                }
-                            }
-                            while worker_pending.load(Ordering::Acquire)
-                                && !worker_stop.load(Ordering::Acquire)
-                            {
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                        }
-                        Err(error) => {
-                            warn!("failed to drain shared notifier: {error}");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        EventForwarder {
-            stop,
-            worker: Some(worker),
-        }
-    })
+    SharedUpdated(WakeAck),
 }
 
 struct CairoBackBuffer {
@@ -190,8 +77,9 @@ struct App {
     default_logical_size: LogicalSize<f64>,
     last_physical_size: PhysicalSize<u32>,
     last_cursor_pos: Option<Point>,
-    shared_path: String,
-    last_transport_attempt: Instant,
+    proxy: EventLoopProxy<UserEvent>,
+    transport_wake: TransportWakeSlot,
+    process_actions: ProcessActionHandler,
 }
 
 impl App {
@@ -200,7 +88,7 @@ impl App {
         bar: CairoBar,
         logical_size: LogicalSize<f64>,
         scale_factor: f64,
-        shared_path: String,
+        proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Self> {
         let physical_size = window.inner_size();
         let soft_context = softbuffer::Context::new(Rc::clone(&window))
@@ -219,8 +107,9 @@ impl App {
             default_logical_size: logical_size,
             last_physical_size: physical_size,
             last_cursor_pos: None,
-            shared_path,
-            last_transport_attempt: Instant::now(),
+            proxy,
+            transport_wake: TransportWakeSlot::new(true),
+            process_actions: ProcessActionHandler::default(),
         })
     }
 
@@ -312,23 +201,19 @@ impl App {
     }
 
     fn tick_and_poll(&mut self) {
-        if !self.shared_path.is_empty()
-            && self.bar.runtime().transport().is_none()
-            && self.last_transport_attempt.elapsed() >= TRANSPORT_RETRY_INTERVAL
-        {
-            self.last_transport_attempt = Instant::now();
-            match SharedTransport::open(&self.shared_path) {
-                Ok(transport) => {
-                    self.bar.runtime_mut().set_transport(Some(transport));
-                    log::debug!("reconnected WM transport at {}", self.shared_path);
-                }
-                Err(error) => log::debug!("WM transport is still unavailable: {error}"),
-            }
-        }
-
         let mut update = self.bar.tick();
         update.merge(self.bar.poll_transport());
         self.handle_runtime_update(update);
+        self.sync_transport_wake();
+    }
+
+    fn sync_transport_wake(&mut self) {
+        let proxy = self.proxy.clone();
+        if let Err(error) = self.transport_wake.sync(self.bar.runtime(), move |ack| {
+            proxy.send_event(UserEvent::SharedUpdated(ack))
+        }) {
+            warn!("failed to synchronize shared transport wake: {error}");
+        }
     }
 
     fn handle_platform_effect(&mut self, effect: BarEffect) {
@@ -339,8 +224,11 @@ impl App {
                     .set_outer_position(LogicalPosition::new(0.0, 0.0));
                 self.window.set_inner_size(self.default_logical_size);
             }
-            BarEffect::Screenshot => spawn_program("flameshot", &["gui"]),
-            BarEffect::OpenAudioControl => spawn_program("pavucontrol", &[]),
+            effect @ (BarEffect::Screenshot | BarEffect::OpenAudioControl) => {
+                if let Err(error) = self.process_actions.handle(effect) {
+                    warn!("failed to handle platform effect: {error}");
+                }
+            }
             BarEffect::WindowManager(_)
             | BarEffect::ToggleMute
             | BarEffect::AdjustVolume(_)
@@ -375,35 +263,16 @@ fn resize_soft_surface(
         .map_err(|error| anyhow::anyhow!("softbuffer resize failed: {error}"))
 }
 
-fn spawn_program(program: &str, args: &[&str]) {
-    let program = program.to_owned();
-    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    thread::spawn(move || {
-        if let Err(error) = Command::new(&program).args(&args).status() {
-            warn!("failed to run {program}: {error}");
-        }
-    });
-}
-
 fn main() -> Result<()> {
     let shared_path = env::args().skip(1).last().unwrap_or_default();
     initialize_logging("tao_softbuffer_bar", &shared_path)?;
 
-    let transport = if shared_path.is_empty() {
-        None
+    let runtime = if shared_path.is_empty() {
+        BarRuntime::new(ModelConfig::default())?
     } else {
-        Some(
-            SharedTransport::open(&shared_path)
-                .with_context(|| format!("failed to open shared transport {shared_path}"))?,
-        )
+        let recovery = TransportRecoveryConfig::new(shared_path.clone(), TRANSPORT_RETRY_INTERVAL)?;
+        BarRuntime::with_managed_transport(ModelConfig::default(), recovery)?
     };
-    let notifier = transport
-        .as_ref()
-        .map(|transport| transport.notifier(true))
-        .transpose()
-        .context("failed to start shared transport notifier")?;
-
-    let runtime = BarRuntime::with_transport(ModelConfig::default(), transport)?;
     let presentation = PresentationConfig {
         bar_height: 38.0,
         ..PresentationConfig::default()
@@ -415,8 +284,8 @@ fn main() -> Result<()> {
 
     let mut event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
-    let _tick_forwarder = spawn_tick_thread(proxy.clone());
-    let _shared_forwarder = spawn_shared_thread(proxy, notifier);
+    let tick_proxy = proxy.clone();
+    let _tick_forwarder = AlignedWakeThread::spawn(move || tick_proxy.send_event(UserEvent::Tick))?;
 
     let primary_monitor: Option<MonitorHandle> = event_loop
         .primary_monitor()
@@ -442,12 +311,13 @@ fn main() -> Result<()> {
             .build(&event_loop)
             .context("failed to build tao window")?,
     );
-    let mut app = App::new(window, bar, logical_size, scale_factor, shared_path)?;
+    let mut app = App::new(window, bar, logical_size, scale_factor, proxy)?;
 
     let update = app.bar.tick();
     app.handle_runtime_update(update);
     let update = app.bar.poll_transport();
     app.handle_runtime_update(update);
+    app.sync_transport_wake();
     app.request_redraw();
 
     let exit_code = event_loop.run_return(move |event, _, control_flow| {
@@ -457,10 +327,10 @@ fn main() -> Result<()> {
             Event::UserEvent(UserEvent::Tick) => {
                 app.tick_and_poll();
             }
-            Event::UserEvent(UserEvent::SharedUpdated(pending)) => {
+            Event::UserEvent(UserEvent::SharedUpdated(_ack)) => {
                 let update = app.bar.poll_transport();
                 app.handle_runtime_update(update);
-                pending.store(false, Ordering::Release);
+                app.sync_transport_wake();
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested | WindowEvent::Destroyed => {
